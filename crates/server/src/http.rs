@@ -1,4 +1,5 @@
-//! HTTP service: AppState, router, and v1 API handlers.
+//! HTTP service: `AppState`, Axum router with v1 API handlers, Prometheus metrics middleware, and
+//! request tracing.
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -24,6 +25,7 @@ use crate::{
 mod v1;
 
 /// Shared application state for all HTTP handlers.
+#[allow(missing_debug_implementations)]
 pub(crate) struct AppState {
     pub(crate) zkvms: Arc<HashMap<ProofType, zkVMInstance>>,
     pub(crate) completed_proofs: Arc<RwLock<LruCache<(Hash256, ProofType), Bytes>>>,
@@ -68,10 +70,15 @@ pub(crate) fn router(state: Arc<AppState>) -> Router {
         )
         .route("/health", get(StatusCode::OK))
         .route("/metrics", get(get_metrics))
+        .fallback(fallback_handler)
         .with_state(state)
         .layer(middleware::from_fn(http_metrics_middleware))
         .layer(TraceLayer::new_for_http())
         .layer(DefaultBodyLimit::max(1 << 30))
+}
+
+async fn fallback_handler() -> v1::ErrorResponse {
+    v1::ErrorResponse::not_found("route not found")
 }
 
 async fn get_metrics(State(state): State<Arc<AppState>>) -> String {
@@ -134,5 +141,27 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), 200);
+    }
+
+    #[tokio::test]
+    async fn test_unknown_route_returns_json_404() {
+        let state = mock_app_state().await;
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .uri("/nonexistent")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 404);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["code"], 404);
+        assert_eq!(json["message"], "route not found");
     }
 }

@@ -1,4 +1,5 @@
-//! Proof generation service.
+//! Proof generation service managing the proof lifecycle: pending (waiting for witness), enqueued
+//! (dispatched to per-zkVM worker), and completed (cached in LRU, broadcast via SSE).
 
 pub mod input;
 pub mod worker;
@@ -23,8 +24,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use worker::WorkerInput;
 use zkboost_types::{
-    Hash256, MainnetEthSpec, NewPayloadRequest, ProofComplete, ProofEvent, ProofFailure,
-    ProofTimeout, ProofType, TreeHash, WitnessTimeout,
+    FailureReason, Hash256, MainnetEthSpec, NewPayloadRequest, ProofComplete, ProofEvent,
+    ProofFailure, ProofType, TreeHash,
 };
 
 use crate::{
@@ -37,10 +38,12 @@ const CLEANUP_INTERVAL: Duration = Duration::from_secs(12);
 /// Messages consumed by the proof service event loop.
 #[derive(Debug)]
 pub(crate) enum ProofServiceMessage {
+    /// A new proof has been requested for the given payload and proof types.
     RequestProof {
         new_payload_request: Arc<NewPayloadRequest<MainnetEthSpec>>,
         proof_types: Vec<ProofType>,
     },
+    /// An execution witness has been fetched and is ready for proof generation.
     WitnessAvailable {
         block_hash: Hash256,
         witness: Arc<ExecutionWitness>,
@@ -55,12 +58,14 @@ struct PendingRequest {
 }
 
 /// Manages proof lifecycle: pending, enqueued, and completed proof requests.
+#[allow(missing_debug_implementations)]
 pub(crate) struct ProofService {
     chain_config: Arc<ChainConfig>,
     completed_proofs: Arc<RwLock<LruCache<(Hash256, ProofType), Bytes>>>,
     proof_event_tx: broadcast::Sender<ProofEvent>,
     witness_service_tx: mpsc::Sender<WitnessServiceMessage>,
     witness_timeout: Duration,
+    proof_timeout: Duration,
     pending: HashMap<Hash256, Vec<PendingRequest>>,
     in_flight: HashSet<(Hash256, ProofType)>,
 }
@@ -73,6 +78,7 @@ impl ProofService {
         proof_event_tx: broadcast::Sender<ProofEvent>,
         witness_service_tx: mpsc::Sender<WitnessServiceMessage>,
         witness_timeout: Duration,
+        proof_timeout: Duration,
     ) -> Self {
         Self {
             chain_config,
@@ -80,6 +86,7 @@ impl ProofService {
             proof_event_tx,
             witness_service_tx,
             witness_timeout,
+            proof_timeout,
             pending: HashMap::new(),
             in_flight: HashSet::new(),
         }
@@ -107,11 +114,11 @@ impl ProofService {
                     break;
                 }
 
-                _ = cleanup_interval.tick() => self.cleanup_stale_requests(),
-
                 Some(output) = worker_output_rx.recv() => self.handle_worker_output(output).await,
 
                 Some(msg) = proof_service_rx.recv() => self.handle_message(msg, &worker_input_txs).await,
+
+                _ = cleanup_interval.tick() => self.cleanup_stale_requests(),
 
                 else => break,
             }
@@ -136,15 +143,22 @@ impl ProofService {
                     );
                     in_flight.remove(&(request.new_payload_request_root, request.proof_type));
                     let _ = proof_event_tx.send(
-                        WitnessTimeout {
+                        ProofFailure {
                             new_payload_request_root: request.new_payload_request_root,
                             proof_type: request.proof_type,
+                            reason: FailureReason::WitnessTimeout,
+                            error: format!(
+                                "witness timeout after {} seconds",
+                                witness_timeout.as_secs()
+                            ),
                         }
                         .into(),
                     );
                 }
+                // Removes timeout requests
                 !is_stale
             });
+            // Removes empty groups
             !entries.is_empty()
         });
     }
@@ -174,6 +188,7 @@ impl ProofService {
                     ProofFailure {
                         new_payload_request_root,
                         proof_type,
+                        reason: FailureReason::ProvingError,
                         error,
                     }
                     .into(),
@@ -181,9 +196,14 @@ impl ProofService {
             }
             ProofResult::Timeout => {
                 let _ = self.proof_event_tx.send(
-                    ProofTimeout {
+                    ProofFailure {
                         new_payload_request_root,
                         proof_type,
+                        reason: FailureReason::ProvingTimeout,
+                        error: format!(
+                            "proving timeout after {} seconds",
+                            self.proof_timeout.as_secs()
+                        ),
                     }
                     .into(),
                 );
@@ -264,6 +284,7 @@ impl ProofService {
                                 ProofFailure {
                                     new_payload_request_root: request.new_payload_request_root,
                                     proof_type: request.proof_type,
+                                    reason: FailureReason::ProvingError,
                                     error: format!("witness service unavailable: {error}"),
                                 }
                                 .into(),
@@ -300,6 +321,7 @@ impl ProofService {
                                 ProofFailure {
                                     new_payload_request_root: request.new_payload_request_root,
                                     proof_type: request.proof_type,
+                                    reason: FailureReason::ProvingError,
                                     error: format!("input construction failed: {e}"),
                                 }
                                 .into(),
@@ -338,6 +360,7 @@ fn dispatch_to_worker(
             ProofFailure {
                 new_payload_request_root,
                 proof_type,
+                reason: FailureReason::ProvingError,
                 error: format!("no zkVM worker for proof type '{proof_type}'"),
             }
             .into(),
@@ -365,6 +388,7 @@ fn dispatch_to_worker(
                 ProofFailure {
                     new_payload_request_root,
                     proof_type,
+                    reason: FailureReason::ProvingError,
                     error: format!("dispatch failed: {reason}"),
                 }
                 .into(),
