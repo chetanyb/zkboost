@@ -5,6 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[[bin]]
+name = "zkboost"
+path = "src/bin/zkboost.rs"
+
 [lints]
 workspace = true
 
@@ -14,6 +18,7 @@ axum = { workspace = true, features = ["macros"] }
 bincode.workspace = true
 bytes.workspace = true
 clap = { workspace = true, features = ["derive"] }
+futures.workspace = true
 lru.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true
@@ -49,6 +54,7 @@ ere-server.workspace = true
 ere-zkvm-interface.workspace = true
 
 # ere-guests
+stateless-validator-common.workspace = true
 stateless-validator-ethrex.workspace = true
 stateless-validator-reth.workspace = true
 

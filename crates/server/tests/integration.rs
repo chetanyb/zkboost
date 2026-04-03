@@ -1,4 +1,4 @@
-//! Integration test for zkboost-server.
+//! Integration test for zkboost.
 
 use std::{
     collections::HashMap,
@@ -171,12 +171,12 @@ impl TestHarness {
         let proof_type = ProofType::EthrexZisk;
         let zkvm_config = zkVMConfig::Mock {
             proof_type,
-            mock_proving_time_ms: 3000,
+            mock_proving_time: zkboost_server::config::MockProvingTime::Constant { ms: 3000 },
             mock_proof_size: 1024,
             mock_failure: behavior.proof_failure,
         };
-        let witness_timeout_secs = if behavior.witness_timeout { 1 } else { 120 };
-        let proof_timeout_secs = if behavior.proof_timeout { 1 } else { 120 };
+        let witness_timeout_secs = if behavior.witness_timeout { 1 } else { 12 };
+        let proof_timeout_secs = if behavior.proof_timeout { 1 } else { 12 };
         let (zkboost_endpoint, shutdown) = start_zkboost_server(
             el_endpoint,
             vec![zkvm_config],

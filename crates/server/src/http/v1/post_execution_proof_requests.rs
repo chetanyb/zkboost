@@ -1,8 +1,8 @@
 //! Handler for `POST /v1/execution_proof_requests`.
 
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
-use axum::{Json, extract::State, http::StatusCode};
+use axum::{Json, extract::State};
 use bytes::Bytes;
 use tracing::instrument;
 use zkboost_types::{
@@ -22,13 +22,26 @@ pub(crate) async fn post_execution_proof_requests(
     State(state): State<Arc<AppState>>,
     Query(params): Query<ProofRequestQuery>,
     body: Bytes,
-) -> Result<(StatusCode, Json<ProofRequestResponse>), ErrorResponse> {
+) -> Result<Json<ProofRequestResponse>, ErrorResponse> {
+    if params.proof_types.is_empty() {
+        return Err(ErrorResponse::bad_request(
+            "empty proof types in request".to_string(),
+        ));
+    }
+
+    let proof_types = HashSet::from_iter(params.proof_types.iter().copied());
+    if proof_types.len() != params.proof_types.len() {
+        return Err(ErrorResponse::bad_request(
+            "duplicate proof types in request".to_string(),
+        ));
+    }
+
     let new_payload_request = NewPayloadRequest::<MainnetEthSpec>::from_ssz_bytes(&body)
         .map_err(|e| ErrorResponse::bad_request(format!("invalid SSZ body: {e:?}")))?;
 
     let new_payload_request_root = new_payload_request.tree_hash_root();
 
-    for proof_type in &params.proof_types {
+    for proof_type in &proof_types {
         if !state.zkvms.contains_key(proof_type) {
             return Err(ErrorResponse::bad_request(format!(
                 "no zkVM configured for proof type '{proof_type}'"
@@ -39,20 +52,18 @@ pub(crate) async fn post_execution_proof_requests(
     state
         .proof_service_tx
         .send(ProofServiceMessage::RequestProof {
+            new_payload_request_root,
             new_payload_request: Arc::new(new_payload_request),
-            proof_types: params.proof_types,
+            proof_types,
         })
         .await
         .map_err(|e| {
             ErrorResponse::internal_server_error(format!("failed to enqueue proof: {e}"))
         })?;
 
-    Ok((
-        StatusCode::OK,
-        Json(ProofRequestResponse {
-            new_payload_request_root,
-        }),
-    ))
+    Ok(Json(ProofRequestResponse {
+        new_payload_request_root,
+    }))
 }
 
 #[cfg(test)]
@@ -81,6 +92,23 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/v1/execution_proof_requests?proof_types=ethrex-zisk")
+                    .header("content-type", "application/octet-stream")
+                    .body(Body::from(vec![0u8; 16]))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 400);
+    }
+
+    #[tokio::test]
+    async fn test_duplicate_proof_types_returns_bad_request() {
+        let state = mock_app_state().await;
+        let response = test_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/execution_proof_requests?proof_types=reth-zisk,reth-zisk")
                     .header("content-type", "application/octet-stream")
                     .body(Body::from(vec![0u8; 16]))
                     .unwrap(),

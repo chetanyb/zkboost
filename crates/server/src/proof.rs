@@ -8,7 +8,7 @@ pub mod zkvm;
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use alloy_genesis::ChainConfig;
@@ -16,45 +16,43 @@ use bytes::Bytes;
 use input::NewPayloadRequestWithWitness;
 use lru::LruCache;
 use stateless::ExecutionWitness;
-use tokio::{
-    sync::{RwLock, broadcast, mpsc, mpsc::error::TrySendError},
-    time::interval,
-};
+use tokio::sync::{RwLock, broadcast, mpsc, mpsc::error::TrySendError};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use worker::WorkerInput;
 use zkboost_types::{
     FailureReason, Hash256, MainnetEthSpec, NewPayloadRequest, ProofComplete, ProofEvent,
-    ProofFailure, ProofType, TreeHash,
+    ProofFailure, ProofType,
 };
 
 use crate::{
+    metrics::record_prove,
     proof::worker::{ProofResult, WorkerOutput},
     witness::WitnessServiceMessage,
 };
-
-const CLEANUP_INTERVAL: Duration = Duration::from_secs(12);
 
 /// Messages consumed by the proof service event loop.
 #[derive(Debug)]
 pub(crate) enum ProofServiceMessage {
     /// A new proof has been requested for the given payload and proof types.
     RequestProof {
+        new_payload_request_root: Hash256,
         new_payload_request: Arc<NewPayloadRequest<MainnetEthSpec>>,
-        proof_types: Vec<ProofType>,
+        proof_types: HashSet<ProofType>,
     },
     /// An execution witness has been fetched and is ready for proof generation.
     WitnessAvailable {
         block_hash: Hash256,
         witness: Arc<ExecutionWitness>,
     },
+    /// The witness service timed out fetching the witness for the given block hash.
+    WitnessTimeout { block_hash: Hash256 },
 }
 
 struct PendingRequest {
     new_payload_request: Arc<NewPayloadRequest<MainnetEthSpec>>,
     new_payload_request_root: Hash256,
-    proof_type: ProofType,
-    created_at: Instant,
+    proof_types: HashSet<ProofType>,
 }
 
 /// Manages proof lifecycle: pending, enqueued, and completed proof requests.
@@ -64,10 +62,9 @@ pub(crate) struct ProofService {
     completed_proofs: Arc<RwLock<LruCache<(Hash256, ProofType), Bytes>>>,
     proof_event_tx: broadcast::Sender<ProofEvent>,
     witness_service_tx: mpsc::Sender<WitnessServiceMessage>,
-    witness_timeout: Duration,
     proof_timeout: Duration,
-    pending: HashMap<Hash256, Vec<PendingRequest>>,
-    in_flight: HashSet<(Hash256, ProofType)>,
+    pending: HashMap<Hash256, PendingRequest>,
+    requested: HashSet<(Hash256, ProofType)>,
 }
 
 impl ProofService {
@@ -77,7 +74,6 @@ impl ProofService {
         completed_proofs: Arc<RwLock<LruCache<(Hash256, ProofType), Bytes>>>,
         proof_event_tx: broadcast::Sender<ProofEvent>,
         witness_service_tx: mpsc::Sender<WitnessServiceMessage>,
-        witness_timeout: Duration,
         proof_timeout: Duration,
     ) -> Self {
         Self {
@@ -85,10 +81,9 @@ impl ProofService {
             completed_proofs,
             proof_event_tx,
             witness_service_tx,
-            witness_timeout,
             proof_timeout,
             pending: HashMap::new(),
-            in_flight: HashSet::new(),
+            requested: HashSet::new(),
         }
     }
 
@@ -100,8 +95,6 @@ impl ProofService {
         mut worker_output_rx: mpsc::Receiver<WorkerOutput>,
         worker_input_txs: HashMap<ProofType, mpsc::Sender<WorkerInput>>,
     ) {
-        let mut cleanup_interval = interval(CLEANUP_INTERVAL);
-
         info!("proof service started");
 
         loop {
@@ -118,8 +111,6 @@ impl ProofService {
 
                 Some(msg) = proof_service_rx.recv() => self.handle_message(msg, &worker_input_txs).await,
 
-                _ = cleanup_interval.tick() => self.cleanup_stale_requests(),
-
                 else => break,
             }
         }
@@ -127,50 +118,17 @@ impl ProofService {
         info!("proof service stopped");
     }
 
-    fn cleanup_stale_requests(&mut self) {
-        let witness_timeout = self.witness_timeout;
-        let in_flight = &mut self.in_flight;
-        let proof_event_tx = &self.proof_event_tx;
-        self.pending.retain(|block_hash, entries| {
-            entries.retain(|request| {
-                let is_stale = request.created_at.elapsed() >= witness_timeout;
-                if is_stale {
-                    warn!(
-                        block_hash = %block_hash,
-                        proof_type = %request.proof_type,
-                        elapsed_secs = request.created_at.elapsed().as_secs(),
-                        "pending request timed out"
-                    );
-                    in_flight.remove(&(request.new_payload_request_root, request.proof_type));
-                    let _ = proof_event_tx.send(
-                        ProofFailure {
-                            new_payload_request_root: request.new_payload_request_root,
-                            proof_type: request.proof_type,
-                            reason: FailureReason::WitnessTimeout,
-                            error: format!(
-                                "witness timeout after {} seconds",
-                                witness_timeout.as_secs()
-                            ),
-                        }
-                        .into(),
-                    );
-                }
-                // Removes timeout requests
-                !is_stale
-            });
-            // Removes empty groups
-            !entries.is_empty()
-        });
-    }
-
     async fn handle_worker_output(&mut self, output: WorkerOutput) {
         let new_payload_request_root = output.new_payload_request_root;
         let proof_type = output.proof_type;
-        self.in_flight
+        let duration = output.duration;
+        self.requested
             .remove(&(new_payload_request_root, proof_type));
 
         match output.proof_result {
             ProofResult::Success(proof) => {
+                let proof_size = proof.len();
+                info!(%new_payload_request_root, %proof_type, proof_size, "proof generated");
                 self.completed_proofs
                     .write()
                     .await
@@ -182,30 +140,29 @@ impl ProofService {
                     }
                     .into(),
                 );
+                record_prove(proof_type, "success", duration, proof_size);
             }
             ProofResult::Failure(error) => {
-                let _ = self.proof_event_tx.send(
-                    ProofFailure {
-                        new_payload_request_root,
-                        proof_type,
-                        reason: FailureReason::ProvingError,
-                        error,
-                    }
-                    .into(),
+                error!(%new_payload_request_root, %proof_type, %error, "proof generation failed");
+                self.fail_request(
+                    new_payload_request_root,
+                    proof_type,
+                    FailureReason::ProvingError,
+                    error,
+                    duration,
                 );
             }
             ProofResult::Timeout => {
-                let _ = self.proof_event_tx.send(
-                    ProofFailure {
-                        new_payload_request_root,
-                        proof_type,
-                        reason: FailureReason::ProvingTimeout,
-                        error: format!(
-                            "proving timeout after {} seconds",
-                            self.proof_timeout.as_secs()
-                        ),
-                    }
-                    .into(),
+                error!(%new_payload_request_root, %proof_type, "proof generation timed out");
+                self.fail_request(
+                    new_payload_request_root,
+                    proof_type,
+                    FailureReason::ProvingTimeout,
+                    format!(
+                        "proving timeout after {} seconds",
+                        self.proof_timeout.as_secs()
+                    ),
+                    duration,
                 );
             }
         }
@@ -218,181 +175,206 @@ impl ProofService {
     ) {
         match message {
             ProofServiceMessage::RequestProof {
+                new_payload_request_root,
                 new_payload_request,
-                proof_types,
+                mut proof_types,
             } => {
                 let block_hash = new_payload_request.block_hash();
-                let new_payload_request_root = new_payload_request.tree_hash_root();
-                let mut fetch_witness = false;
 
-                for proof_type in proof_types {
-                    {
-                        let cache = self.completed_proofs.read().await;
-                        if cache.contains(&(new_payload_request_root, proof_type)) {
+                // Deduplicate
+                {
+                    let cache = self.completed_proofs.read().await;
+                    proof_types.retain(|proof_type| {
+                        if cache.contains(&(new_payload_request_root, *proof_type)) {
                             debug!(
                                 %new_payload_request_root,
-                                proof_type = %proof_type,
+                                %proof_type,
                                 "proof already completed"
                             );
-                            continue;
+                            return false;
                         }
-                    }
 
-                    if !self
-                        .in_flight
-                        .insert((new_payload_request_root, proof_type))
-                    {
-                        debug!(
-                            %new_payload_request_root,
-                            proof_type = %proof_type,
-                            "duplicate proof request"
-                        );
-                        continue;
-                    }
+                        if !self
+                            .requested
+                            .insert((new_payload_request_root, *proof_type))
+                        {
+                            debug!(
+                                %new_payload_request_root,
+                                %proof_type,
+                                "duplicate proof request"
+                            );
+                            return false;
+                        }
 
-                    debug!(
-                        %new_payload_request_root,
-                        %block_hash,
-                        proof_type = %proof_type,
-                        "new proof request"
-                    );
-
-                    self.pending
-                        .entry(block_hash)
-                        .or_default()
-                        .push(PendingRequest {
-                            new_payload_request: new_payload_request.clone(),
-                            new_payload_request_root,
-                            proof_type,
-                            created_at: Instant::now(),
-                        });
-                    fetch_witness = true;
+                        true
+                    });
                 }
 
-                if fetch_witness
+                if proof_types.is_empty() {
+                    return;
+                }
+
+                debug!(
+                    %new_payload_request_root,
+                    %block_hash,
+                    ?proof_types,
+                    "new proof requests"
+                );
+
+                if !self.pending.contains_key(&block_hash)
                     && let Err(error) = self
                         .witness_service_tx
                         .send(WitnessServiceMessage::FetchWitness { block_hash })
                         .await
                 {
-                    error!(error = %error, "witness request send failed");
-                    if let Some(entries) = self.pending.remove(&block_hash) {
-                        for request in &entries {
-                            self.in_flight
-                                .remove(&(request.new_payload_request_root, request.proof_type));
-                            let _ = self.proof_event_tx.send(
-                                ProofFailure {
-                                    new_payload_request_root: request.new_payload_request_root,
-                                    proof_type: request.proof_type,
-                                    reason: FailureReason::ProvingError,
-                                    error: format!("witness service unavailable: {error}"),
-                                }
-                                .into(),
-                            );
-                        }
+                    error!(error = %error, "fetch witness send failed");
+                    for &proof_type in &proof_types {
+                        self.fail_request(
+                            new_payload_request_root,
+                            proof_type,
+                            FailureReason::InternalError,
+                            format!("witness service unavailable: {error}"),
+                            Duration::ZERO,
+                        );
                     }
+                    return;
                 }
+
+                self.pending
+                    .entry(block_hash)
+                    .and_modify(|r| {
+                        r.proof_types.extend(proof_types.iter().copied());
+                    })
+                    .or_insert_with(|| PendingRequest {
+                        new_payload_request: new_payload_request.clone(),
+                        new_payload_request_root,
+                        proof_types,
+                    });
             }
             ProofServiceMessage::WitnessAvailable {
                 block_hash,
                 witness,
             } => {
-                let Some(pending) = self.pending.remove(&block_hash) else {
+                let Some(request) = self.pending.remove(&block_hash) else {
                     return;
                 };
 
                 info!(
                     %block_hash,
-                    count = pending.len(),
+                    count = request.proof_types.len(),
                     "dispatching pending requests"
                 );
 
                 let input = match NewPayloadRequestWithWitness::new(
-                    &pending[0].new_payload_request,
+                    &request.new_payload_request,
+                    request.new_payload_request_root,
                     witness,
                     self.chain_config.clone(),
                 ) {
                     Ok(input) => Arc::new(input),
                     Err(e) => {
-                        for request in &pending {
-                            self.in_flight
-                                .remove(&(request.new_payload_request_root, request.proof_type));
-                            let _ = self.proof_event_tx.send(
-                                ProofFailure {
-                                    new_payload_request_root: request.new_payload_request_root,
-                                    proof_type: request.proof_type,
-                                    reason: FailureReason::ProvingError,
-                                    error: format!("input construction failed: {e}"),
-                                }
-                                .into(),
+                        for &proof_type in &request.proof_types {
+                            self.fail_request(
+                                request.new_payload_request_root,
+                                proof_type,
+                                FailureReason::ProvingError,
+                                format!("input construction failed: {e}"),
+                                Duration::ZERO,
                             );
                         }
                         return;
                     }
                 };
 
-                for request in pending {
-                    dispatch_to_worker(
-                        worker_input_txs,
-                        &self.proof_event_tx,
-                        &mut self.in_flight,
-                        request.proof_type,
-                        input.clone(),
+                for proof_type in request.proof_types {
+                    self.dispatch_to_worker(worker_input_txs, proof_type, input.clone());
+                }
+            }
+            ProofServiceMessage::WitnessTimeout { block_hash } => {
+                let Some(request) = self.pending.remove(&block_hash) else {
+                    return;
+                };
+                for &proof_type in &request.proof_types {
+                    warn!(%block_hash, %proof_type, "pending request witness timed out");
+                    self.fail_request(
+                        request.new_payload_request_root,
+                        proof_type,
+                        FailureReason::WitnessTimeout,
+                        format!("witness timeout for block {block_hash}"),
+                        Duration::ZERO,
                     );
                 }
             }
         }
     }
-}
 
-fn dispatch_to_worker(
-    worker_input_txs: &HashMap<ProofType, mpsc::Sender<WorkerInput>>,
-    proof_event_tx: &broadcast::Sender<ProofEvent>,
-    in_flight: &mut HashSet<(Hash256, ProofType)>,
-    proof_type: ProofType,
-    payload: Arc<NewPayloadRequestWithWitness>,
-) {
-    let new_payload_request_root = payload.root();
+    fn dispatch_to_worker(
+        &mut self,
+        worker_input_txs: &HashMap<ProofType, mpsc::Sender<WorkerInput>>,
+        proof_type: ProofType,
+        payload: Arc<NewPayloadRequestWithWitness>,
+    ) {
+        let new_payload_request_root = payload.root();
 
-    let Some(tx) = worker_input_txs.get(&proof_type) else {
-        in_flight.remove(&(new_payload_request_root, proof_type));
-        let _ = proof_event_tx.send(
+        let Some(tx) = worker_input_txs.get(&proof_type) else {
+            self.fail_request(
+                new_payload_request_root,
+                proof_type,
+                FailureReason::InternalError,
+                format!("no zkVM worker for proof type '{proof_type}'"),
+                Duration::ZERO,
+            );
+            return;
+        };
+
+        let worker_input = WorkerInput { payload };
+        match tx.try_send(worker_input) {
+            Ok(()) => {
+                debug!(%proof_type, "proof dispatched");
+            }
+            Err(error) => {
+                let reason = match &error {
+                    TrySendError::Full(_) => "worker channel full",
+                    TrySendError::Closed(_) => "worker channel closed",
+                };
+                self.fail_request(
+                    new_payload_request_root,
+                    proof_type,
+                    FailureReason::InternalError,
+                    format!("dispatch failed: {reason}"),
+                    Duration::ZERO,
+                );
+            }
+        }
+    }
+
+    fn fail_request(
+        &mut self,
+        new_payload_request_root: Hash256,
+        proof_type: ProofType,
+        reason: FailureReason,
+        error: String,
+        duration: Duration,
+    ) {
+        self.requested
+            .remove(&(new_payload_request_root, proof_type));
+        let _ = self.proof_event_tx.send(
             ProofFailure {
                 new_payload_request_root,
                 proof_type,
-                reason: FailureReason::ProvingError,
-                error: format!("no zkVM worker for proof type '{proof_type}'"),
+                reason,
+                error,
             }
             .into(),
         );
-        return;
-    };
-
-    let worker_input = WorkerInput {
-        payload,
-        new_payload_request_root,
-        proof_type,
-    };
-
-    match tx.try_send(worker_input) {
-        Ok(()) => {
-            debug!(proof_type = %proof_type, "proof dispatched");
-        }
-        Err(error) => {
-            let reason = match &error {
-                TrySendError::Full(_) => "worker channel full",
-                TrySendError::Closed(_) => "worker channel closed",
-            };
-            in_flight.remove(&(new_payload_request_root, proof_type));
-            let _ = proof_event_tx.send(
-                ProofFailure {
-                    new_payload_request_root,
-                    proof_type,
-                    reason: FailureReason::ProvingError,
-                    error: format!("dispatch failed: {reason}"),
-                }
-                .into(),
-            );
-        }
+        record_prove(
+            proof_type,
+            match reason {
+                FailureReason::WitnessTimeout | FailureReason::ProvingTimeout => "timeout",
+                FailureReason::ProvingError | FailureReason::InternalError => "error",
+            },
+            duration,
+            0,
+        );
     }
 }

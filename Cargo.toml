@@ -9,7 +9,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.3.1"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.91"
 license = "MIT OR Apache-2.0"
@@ -84,6 +84,7 @@ ere-server = { git = "https://github.com/eth-act/ere", tag = "v0.6.1" }
 ere-zkvm-interface = { git = "https://github.com/eth-act/ere", tag = "v0.6.1" }
 
 # ere-guests
+stateless-validator-common = { git = "https://github.com/eth-act/ere-guests", tag = "v0.7.0" }
 stateless-validator-ethrex = { git = "https://github.com/eth-act/ere-guests", tag = "v0.7.0", features = ["host"] }
 stateless-validator-reth = { git = "https://github.com/eth-act/ere-guests", tag = "v0.7.0", features = ["host"] }
 

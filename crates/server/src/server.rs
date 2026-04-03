@@ -145,7 +145,6 @@ impl zkBoostServer {
             completed_proofs.clone(),
             proof_event_tx,
             witness_service_tx,
-            witness_timeout,
             proof_timeout,
         );
         handles.push(tokio::spawn(proof_service.run(
@@ -160,9 +159,9 @@ impl zkBoostServer {
         let app_state = Arc::new(AppState::new(
             self.zkvms.clone(),
             completed_proofs,
+            self.metrics,
             proof_service_tx,
             proof_event_rx,
-            self.metrics,
         ));
         let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, self.config.port)).await?;
         let addr = listener.local_addr()?;

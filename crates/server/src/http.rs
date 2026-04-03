@@ -29,9 +29,9 @@ mod v1;
 pub(crate) struct AppState {
     pub(crate) zkvms: Arc<HashMap<ProofType, zkVMInstance>>,
     pub(crate) completed_proofs: Arc<RwLock<LruCache<(Hash256, ProofType), Bytes>>>,
-    pub(crate) proof_service_tx: mpsc::Sender<ProofServiceMessage>,
-    pub(crate) proof_event_receiver: broadcast::Receiver<ProofEvent>,
     pub(crate) metrics: PrometheusHandle,
+    pub(crate) proof_service_tx: mpsc::Sender<ProofServiceMessage>,
+    pub(crate) proof_event_rx: broadcast::Receiver<ProofEvent>,
 }
 
 impl AppState {
@@ -39,16 +39,16 @@ impl AppState {
     pub(crate) fn new(
         zkvms: Arc<HashMap<ProofType, zkVMInstance>>,
         completed_proofs: Arc<RwLock<LruCache<(Hash256, ProofType), Bytes>>>,
-        proof_service_tx: mpsc::Sender<ProofServiceMessage>,
-        proof_event_receiver: broadcast::Receiver<ProofEvent>,
         metrics: PrometheusHandle,
+        proof_service_tx: mpsc::Sender<ProofServiceMessage>,
+        proof_event_rx: broadcast::Receiver<ProofEvent>,
     ) -> Self {
         Self {
             zkvms,
             completed_proofs,
-            proof_service_tx,
-            proof_event_receiver,
             metrics,
+            proof_service_tx,
+            proof_event_rx,
         }
     }
 }
@@ -97,7 +97,7 @@ pub(crate) mod tests {
     use zkboost_types::{ProofEvent, ProofType};
 
     use crate::{
-        config::zkVMConfig,
+        config::{MockProvingTime, zkVMConfig},
         http::{AppState, router},
         proof::{ProofServiceMessage, zkvm::zkVMInstance},
     };
@@ -105,12 +105,12 @@ pub(crate) mod tests {
     pub(crate) async fn mock_app_state() -> Arc<AppState> {
         let completed_proofs =
             Arc::new(RwLock::new(LruCache::new(NonZeroUsize::new(128).unwrap())));
-        let (_, proof_event_receiver) = broadcast::channel::<ProofEvent>(16);
+        let (_, proof_event_rx) = broadcast::channel::<ProofEvent>(16);
         let (proof_service_tx, _) = mpsc::channel::<ProofServiceMessage>(16);
 
         let mock_config = zkVMConfig::Mock {
             proof_type: ProofType::RethZisk,
-            mock_proving_time_ms: 10,
+            mock_proving_time: MockProvingTime::Constant { ms: 10 },
             mock_proof_size: 64,
             mock_failure: false,
         };
@@ -122,9 +122,9 @@ pub(crate) mod tests {
         Arc::new(AppState::new(
             zkvms,
             completed_proofs,
-            proof_service_tx,
-            proof_event_receiver,
             metrics,
+            proof_service_tx,
+            proof_event_rx,
         ))
     }
 
