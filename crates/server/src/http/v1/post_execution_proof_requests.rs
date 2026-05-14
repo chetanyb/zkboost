@@ -48,15 +48,16 @@ pub(crate) async fn post_execution_proof_requests(
     // before wasting resources on witness fetching.
     for proof_type in &proof_types {
         if let Some(zkvm) = state.zkvms.get(proof_type)
-            && matches!(zkvm, zkVMInstance::Verifier { .. }) {
-                debug!(
-                    %proof_type,
-                    "rejecting proof request: verifier-only instance"
-                );
-                return Err(ErrorResponse::bad_request(format!(
-                    "proof generation not supported for verifier-only zkvm '{proof_type}'"
-                )));
-            }
+            && matches!(zkvm, zkVMInstance::Verifier { .. })
+        {
+            debug!(
+                %proof_type,
+                "rejecting proof request: verifier-only instance"
+            );
+            return Err(ErrorResponse::bad_request(format!(
+                "proof generation not supported for verifier-only zkvm '{proof_type}'"
+            )));
+        }
     }
 
     let new_payload_request = NewPayloadRequest::<MainnetEthSpec>::from_ssz_bytes(&body)
