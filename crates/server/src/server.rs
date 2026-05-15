@@ -79,10 +79,22 @@ impl zkBoostServer {
         let mut zkvms = HashMap::new();
         for zkvm_config in &config.zkvm {
             let instance = zkVMInstance::new(zkvm_config).await?;
+            let mode = match zkvm_config {
+                crate::config::zkVMConfig::Ere { .. } => "prover",
+                crate::config::zkVMConfig::Mock { .. } => "mock",
+                crate::config::zkVMConfig::Verifier { .. } => "verifier-only",
+            };
             info!(
                 proof_type = %zkvm_config.proof_type(),
+                mode,
                 "zkvm instance created"
             );
+            if matches!(zkvm_config, crate::config::zkVMConfig::Verifier { .. }) {
+                info!(
+                    proof_type = %zkvm_config.proof_type(),
+                    "verifier-only mode: proof generation requests will be rejected"
+                );
+            }
             zkvms.insert(zkvm_config.proof_type(), instance);
         }
         set_programs_loaded(zkvms.len());

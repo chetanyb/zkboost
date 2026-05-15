@@ -4,7 +4,7 @@ use std::{collections::HashSet, sync::Arc};
 
 use axum::{Json, extract::State};
 use bytes::Bytes;
-use tracing::{info_span, instrument};
+use tracing::{debug, info_span, instrument};
 use zkboost_types::{
     Decode, MainnetEthSpec, NewPayloadRequest, ProofRequestQuery, ProofRequestResponse, TreeHash,
 };
@@ -14,7 +14,7 @@ use crate::{
         AppState,
         v1::{ErrorResponse, Query},
     },
-    proof::ProofServiceMessage,
+    proof::{ProofServiceMessage, zkvm::zkVMInstance},
 };
 
 #[instrument(skip_all)]
@@ -40,6 +40,22 @@ pub(crate) async fn post_execution_proof_requests(
         if !state.zkvms.contains_key(proof_type) {
             return Err(ErrorResponse::bad_request(format!(
                 "no zkVM configured for proof type '{proof_type}'"
+            )));
+        }
+    }
+
+    // Reject proof generation requests for verifier-only instances early,
+    // before wasting resources on witness fetching.
+    for proof_type in &proof_types {
+        if let Some(zkvm) = state.zkvms.get(proof_type)
+            && matches!(zkvm, zkVMInstance::Verifier { .. })
+        {
+            debug!(
+                %proof_type,
+                "rejecting proof request: verifier-only instance"
+            );
+            return Err(ErrorResponse::bad_request(format!(
+                "proof generation not supported for verifier-only zkvm '{proof_type}'"
             )));
         }
     }
