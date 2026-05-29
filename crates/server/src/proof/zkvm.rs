@@ -337,6 +337,7 @@ pub(crate) fn expected_public_values(
 mod tests {
     use std::sync::Arc;
 
+    use ere_verifier::{Verifier, zkVMKind};
     use zkboost_types::{BackendKind, ProofType};
 
     use super::*;
@@ -366,6 +367,14 @@ mod tests {
         }
     }
 
+    /// Creates a test Verifier instance.
+    fn test_verifier_instance() -> zkVMInstance {
+        zkVMInstance::Verifier {
+            proof_type: ProofType::RethZisk,
+            verifier: Arc::new(Verifier::new(zkVMKind::Zisk, &[0; 32]).unwrap()),
+        }
+    }
+
     #[test]
     fn test_ere_backend_capabilities() {
         let instance = test_ere_instance();
@@ -386,10 +395,13 @@ mod tests {
         assert!(can_verify, "mock backends can verify");
     }
 
-    // Note: zkVMInstance::Verifier is not directly tested here because
-    // constructing a Verifier requires a valid program VK file. However:
-    // 1. The match in backend_capabilities() is exhaustive - compiler enforces all variants
-    // 2. The logic is trivial (just returning constants)
-    // 3. The capability mapping (can_prove=false, can_verify=true) is documented in REQUIREMENTS.md
-    // 4. Integration tests with real Verifier instances provide full coverage
+    #[test]
+    fn test_verifier_backend_capabilities() {
+        let instance = test_verifier_instance();
+        let (kind, can_prove, can_verify) = instance.backend_capabilities();
+
+        assert_eq!(kind, BackendKind::Verifier);
+        assert!(!can_prove, "verifier backends can not prove");
+        assert!(can_verify, "verifier backends can verify");
+    }
 }
