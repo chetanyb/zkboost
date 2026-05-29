@@ -266,6 +266,41 @@
                     }
                 }
             }
+        },
+        "/v1/proof_types": {
+            "get": {
+                "operationId": "getProofTypes",
+                "summary": "List configured proof types and their capabilities",
+                "description": "Returns the list of proof types initialized on this server, along with their backend kind and capabilities (can_prove, can_verify). Useful for discovering what proof types are available before submitting requests.",
+                "responses": {
+                    "200": {
+                        "description": "List of configured proof types.",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/ProofTypesResponse"
+                                },
+                                "example": {
+                                    "proof_types": [
+                                        {
+                                            "proof_type": "reth-sp1",
+                                            "kind": "ere",
+                                            "can_prove": true,
+                                            "can_verify": true
+                                        },
+                                        {
+                                            "proof_type": "reth-zisk",
+                                            "kind": "verifier",
+                                            "can_prove": false,
+                                            "can_verify": true
+                                        }
+                                    ]
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     },
     "components": {
@@ -393,6 +428,57 @@
                     }
                 },
                 "description": "SSE event payload for `proof_failure`."
+            },
+            "BackendKind": {
+                "type": "string",
+                "enum": [
+                    "ere",
+                    "mock",
+                    "verifier"
+                ],
+                "description": "Backend kind for a zkVM instance. ere: remote ere-server backend. mock: in-process mock backend for testing. verifier: in-process verifier-only backend (cannot prove)."
+            },
+            "ProofTypeInfo": {
+                "type": "object",
+                "required": [
+                    "proof_type",
+                    "kind",
+                    "can_prove",
+                    "can_verify"
+                ],
+                "properties": {
+                    "proof_type": {
+                        "$ref": "#/components/schemas/ProofType"
+                    },
+                    "kind": {
+                        "$ref": "#/components/schemas/BackendKind"
+                    },
+                    "can_prove": {
+                        "type": "boolean",
+                        "description": "Whether this backend can generate proofs."
+                    },
+                    "can_verify": {
+                        "type": "boolean",
+                        "description": "Whether this backend can verify proofs."
+                    }
+                },
+                "description": "Information about a single initialized proof type."
+            },
+            "ProofTypesResponse": {
+                "type": "object",
+                "required": [
+                    "proof_types"
+                ],
+                "properties": {
+                    "proof_types": {
+                        "type": "array",
+                        "items": {
+                            "$ref": "#/components/schemas/ProofTypeInfo"
+                        },
+                        "description": "List of initialized proof types, sorted by proof_type."
+                    }
+                },
+                "description": "Response for GET /v1/proof_types."
             }
         }
     }

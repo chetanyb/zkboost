@@ -126,6 +126,7 @@ The following endpoints are available:
 | `GET`  | `/v1/execution_proof_requests?new_payload_request_root=`       | SSE stream of proof result                                    |
 | `GET`  | `/v1/execution_proofs/{new_payload_request_root}/{proof_type}` | Fetch a completed proof                                       |
 | `POST` | `/v1/execution_proof_verifications`                            | Verify a proof                                                |
+| `GET`  | `/v1/proof_types`                                              | List configured proof types and capabilities                  |
 | `GET`  | `/health`                                                      | Health check                                                  |
 | `GET`  | `/metrics`                                                     | Prometheus metrics                                            |
 
